@@ -27,3 +27,6 @@ coverage.xml
 # OS junk
 .DS_Store
 Thumbs.db
+
+# password files
+password/
