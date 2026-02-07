@@ -6,12 +6,36 @@ from __future__ import annotations
 import ctypes
 import ctypes.wintypes as wt
 import locale
+import os
 import re
+import shutil
 import subprocess
+import sys
 import time
 import unicodedata
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Any, Optional, Tuple
+
+IS_WINDOWS = sys.platform.startswith("win")
+IS_LINUX = sys.platform.startswith("linux")
+
+
+if not hasattr(ctypes, "WINFUNCTYPE"):
+    ctypes.WINFUNCTYPE = ctypes.CFUNCTYPE  # type: ignore[attr-defined]
+
+
+if not IS_WINDOWS:
+    class _DummyFunction:
+        def __call__(self, *_args, **_kwargs):
+            return 1
+
+
+    class _DummyDLL:
+        def __getattr__(self, _name: str):
+            return _DummyFunction()
+
+
+    ctypes.WinDLL = lambda _name: _DummyDLL()  # type: ignore[attr-defined]
 
 
 # -------------------------
@@ -242,6 +266,32 @@ class WifiNetwork:
 
 
 def _run_netsh_bytes(args: List[str]) -> Tuple[int, bytes]:
+    if IS_LINUX:
+        if not shutil.which("nmcli"):
+            return 127, b""
+        env = os.environ.copy()
+        env["LC_ALL"] = "C"
+        env["LANG"] = "C"
+        p = subprocess.run(
+            [
+                "nmcli",
+                "-m",
+                "multiline",
+                "-f",
+                "SSID,BSSID,SIGNAL,SECURITY,CHAN",
+                "dev",
+                "wifi",
+                "list",
+                "--rescan",
+                "yes",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            shell=False,
+            env=env,
+        )
+        return p.returncode, p.stdout
+
     p = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, shell=False)
     return p.returncode, p.stdout
 
@@ -270,6 +320,70 @@ _RE_CH = re.compile(r"^\s*(频道|Channel)\s*:\s*(.*)\s*$", re.I)
 
 
 def parse_netsh_networks(raw: str) -> Tuple[List[WifiNetwork], Dict[str, Any]]:
+    if IS_LINUX:
+        entries: List[Dict[str, str]] = []
+        cur_entry: Dict[str, str] = {}
+
+        for ln in raw.splitlines():
+            line = ln.strip()
+            if not line:
+                if cur_entry:
+                    entries.append(cur_entry)
+                    cur_entry = {}
+                continue
+            if ":" not in line:
+                continue
+            k, v = line.split(":", 1)
+            cur_entry[k.strip().upper()] = v.strip()
+
+        if cur_entry:
+            entries.append(cur_entry)
+
+        grouped: Dict[Tuple[str, Optional[str], Optional[str]], WifiNetwork] = {}
+        order: List[Tuple[str, Optional[str], Optional[str]]] = []
+
+        for entry in entries:
+            ssid = entry.get("SSID", "").strip() or "<hidden>"
+            security = entry.get("SECURITY", "").strip()
+            auth = "OPEN" if security in ("", "--") else security
+            cipher = None
+            key = (ssid, auth, cipher)
+
+            if key not in grouped:
+                grouped[key] = WifiNetwork(ssid=ssid, auth=auth, cipher=cipher, bssids=[])
+                order.append(key)
+
+            bssid = entry.get("BSSID", "").strip().lower()
+            if not bssid:
+                continue
+
+            signal_pct: Optional[int] = None
+            signal_str = entry.get("SIGNAL", "").strip()
+            if signal_str.isdigit():
+                signal_pct = int(signal_str)
+
+            channel = entry.get("CHAN", "").strip() or None
+            grouped[key].bssids.append(
+                WifiBssid(
+                    bssid=bssid,
+                    signal_pct=signal_pct,
+                    channel=channel,
+                )
+            )
+
+        nets: List[WifiNetwork] = []
+        for key in order:
+            net = grouped[key]
+            best = None
+            for b in net.bssids or []:
+                if b.signal_pct is not None:
+                    best = b.signal_pct if best is None else max(best, b.signal_pct)
+            net.best_signal_pct = best
+            nets.append(net)
+
+        dbg = {"visible_count": len(nets), "parsed_count": len(nets)}
+        return nets, dbg
+
     lines = raw.splitlines()
     visible = None
     for ln in lines[:20]:
